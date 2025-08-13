@@ -10,6 +10,9 @@ type RedisBackend interface {
 	CheckAndIncrementBucket(key string) (bool, error)
 }
 
+type SingleRedisConfig struct {
+}
+
 type SingleRedisBackend struct {
 	client *redis.Client
 }
@@ -38,4 +41,10 @@ func NewSingleRedisBackend(config *RLConfig) SingleRedisBackend {
 		MaxRetryBackoff: 512 * time.Millisecond,
 	})
 	return SingleRedisBackend{client}
+}
+
+type ManualShardConfig struct {
+}
+
+type ClusterRedisConfig struct {
 }
