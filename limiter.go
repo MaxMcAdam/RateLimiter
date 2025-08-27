@@ -2,12 +2,50 @@ package ratelimiter
 
 import (
 	"context"
+	"fmt"
 	"time"
+
+	redis "github.com/redis/go-redis/v9"
 )
 
+// Token bucket Lua script - business logic centralized here
+const tokenBucketScript = `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])  -- tokens per second
+local requested = tonumber(ARGV[3])
+local now = tonumber(ARGV[4])
+
+-- Get current bucket state
+local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1]) or capacity
+local last_refill = tonumber(bucket[2]) or now
+
+-- Calculate tokens to add based on time elapsed
+local elapsed = math.max(0, now - last_refill)
+local tokens_to_add = math.floor(elapsed * refill_rate)
+tokens = math.min(capacity, tokens + tokens_to_add)
+
+-- Check if we can fulfill the request
+if tokens >= requested then
+    tokens = tokens - requested
+    -- Update bucket state
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('EXPIRE', key, 3600)  -- TTL for cleanup
+    return {1, tokens}  -- {allowed, remaining_tokens}
+else
+    -- Update last_refill time even if denied
+    redis.call('HMSET', key, 'tokens', tokens, 'last_refill', now)
+    redis.call('EXPIRE', key, 3600)
+    return {0, tokens}  -- {denied, current_tokens}
+end
+`
+
 type Ratelimiter struct {
-	persistence *RedisBackend
+	redis       RedisOperations
 	config      *RLConfig
+	tokenScript *redis.Script
+	key         func(string, string, *RLConfig) string // accepts ip then endpoint and returns the redis key approriate for the granularity
 }
 
 type RequestContext struct {
@@ -18,68 +56,107 @@ type RequestContext struct {
 	Timestamp time.Time // For pattern analysis
 }
 
-type RLConfig struct {
-	Granularity       string              `yaml:"granularity"` // Options are "ip", "endpoint", or "tiered"
-	EndpointConfig    *EndpointConfig     `yaml:"endpoint_config"`
-	TieredConfig      *TieredConfig       `yaml:"tiered_config"`
-	IPConfig          *BucketSpec         `yaml:"ip_spec"`
-	RedisMode         string              `yaml:"redis_mode"` // Options are "single", "manual_sharding", "cluster"
-	SingleRedisConfig *SingleRedisConfig  `yaml:"single_redis_config"`
-	ManualShardConfig *ManualShardConfig  `yaml:"manual_shard_config"`
-	ClusterRedisCnfig *ClusterRedisConfig `yaml:"cluster_redis_config"`
-}
+func New(config *RLConfig) (*Ratelimiter, error) {
+	redis, err := NewRedisBackend(config)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create Redis backend: %w", err)
+	}
 
-type TieredConfig struct {
-	TierSpec       map[string]BucketSpec `yaml:"tier_spec"`
-	EndpointToTier map[string]string     `yaml:"endpoint_to_tier"`
-	DefaultSpec    BucketSpec
-}
+	var key func(string, string, *RLConfig) string
 
-func (c TieredConfig) GetBucketSpecForEndpoint(endpoint string) BucketSpec {
-	if tier, ok := c.EndpointToTier[endpoint]; ok {
-		if spec, ok := c.TierSpec[tier]; ok {
-			return spec
+	switch config.Granularity {
+	case GRANULARITY_IP:
+		key = func(ip string, endpoint string, cfg *RLConfig) string {
+			return fmt.Sprintf("%s:%s", REDIS_KEY_PREFIX, ip)
+		}
+	case GRANULARITY_ENDPOINT:
+		key = func(ip string, endpoint string, cfg *RLConfig) string {
+			return fmt.Sprintf("%s:%s:%s", REDIS_KEY_PREFIX, ip, endpoint)
+		}
+	case GRANULARITY_TIER:
+		key = func(ip string, endpoint string, cfg *RLConfig) string {
+			if tier, ok := cfg.TieredConfig.EndpointToTier[endpoint]; ok {
+				return fmt.Sprintf("%s:%s", tier, ip)
+			}
+			return fmt.Sprintf("%s:%s", DEFAULT_TIER, ip)
 		}
 	}
 
-	return c.DefaultSpec
+	return &Ratelimiter{
+		redis:       redis,
+		config:      config,
+		tokenScript: redis.NewScript(tokenBucketScript),
+		key:         key,
+	}, nil
 }
 
-type EndpointConfig struct {
-	PerEndpointSpecs map[string]BucketSpec `yaml:"per_endpoint_specs"`
-	DefaultSpec      BucketSpec            `yaml:"default_spec"`
-}
+func (rl *Ratelimiter) Allow(ctx context.Context, reqCtx RequestContext) (bool, error) {
+	// Generate rate limit key based on granularity
+	key := rl.generateKey(reqCtx)
 
-func (c *EndpointConfig) GetBucketSpecForEndpoint(endpoint string) BucketSpec {
-	if spec, ok := c.PerEndpointSpecs[endpoint]; ok {
-		return spec
-	} else {
-		return c.DefaultSpec
+	// Get bucket specification for this request
+	bucketSpec := rl.config.GetBucketSpecForEndpoint(reqCtx.Endpoint)
+
+	// Convert refill rate from tokens/minute to tokens/second
+	refillRatePerSecond := float64(bucketSpec.RefillRate) / 60.0
+
+	// Execute token bucket algorithm
+	result, err := rl.tokenScript.Run(ctx, rl.redis, []string{key},
+		bucketSpec.Capacity,
+		refillRatePerSecond,
+		1, // requesting 1 token
+		time.Now().Unix()).Result()
+
+	if err != nil {
+		return false, fmt.Errorf("redis script execution failed: %w", err)
 	}
+
+	// Parse result
+	values := result.([]interface{})
+	allowed := values[0].(int64) == 1
+	// remaining := values[1].(int64) // Could be used for response headers
+
+	return allowed, nil
 }
 
-type BucketSpec struct {
-	Capacity   uint64 `yaml:"capacity"`    // Max tokens per bucket
-	RefillRate uint64 `yaml:"refill_rate"` // Tokens per minute refill rate
+func (rl *Ratelimiter) generateKey(reqCtx RequestContext) string {
+	return rl.key(reqCtx.ClientIP, reqCtx.Endpoint, rl.config)
 }
 
-func (c *RLConfig) GetBucketSpecForEndpoint(endpoint string) BucketSpec {
-	if c.EndpointConfig != nil {
-		return c.EndpointConfig.GetBucketSpecForEndpoint(endpoint)
-	} else if c.TieredConfig != nil {
-		return c.TieredConfig.GetBucketSpecForEndpoint(endpoint)
+// Optional: Method for getting current bucket status without consuming tokens
+func (rl *Ratelimiter) GetBucketStatus(ctx context.Context, reqCtx RequestContext) (tokens int64, err error) {
+	key := rl.generateKey(reqCtx)
+
+	// Simple script to get current tokens without consuming
+	statusScriptText := `
+local key = KEYS[1]
+local capacity = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local now = tonumber(ARGV[3])
+
+local bucket = redis.call('HMGET', key, 'tokens', 'last_refill')
+local tokens = tonumber(bucket[1]) or capacity
+local last_refill = tonumber(bucket[2]) or now
+
+local elapsed = math.max(0, now - last_refill)
+local tokens_to_add = math.floor(elapsed * refill_rate)
+tokens = math.min(capacity, tokens + tokens_to_add)
+
+return tokens
+`
+
+	bucketSpec := rl.config.GetBucketSpecForEndpoint(reqCtx.Endpoint)
+	refillRatePerSecond := float64(bucketSpec.RefillRate) / 60.0
+
+	// Use EvalRO since this is read-only operation
+	result, err := rl.redis.EvalRO(ctx, statusScriptText, []string{key},
+		bucketSpec.Capacity,
+		refillRatePerSecond,
+		time.Now().Unix()).Result()
+
+	if err != nil {
+		return 0, err
 	}
-	return *c.IPConfig
-}
 
-func New(config RLConfig) Ratelimiter {
-	return Ratelimiter{}
-}
-
-func (rl *Ratelimiter) Allow(ctx *context.Context, reqCtx RequestContext) (bool, error) {
-	endpoint := reqCtx.Endpoint
-
-	refillRate := rl.config.GetRefillForEndpoint()
-
-	return true, nil
+	return result.(int64), nil
 }
